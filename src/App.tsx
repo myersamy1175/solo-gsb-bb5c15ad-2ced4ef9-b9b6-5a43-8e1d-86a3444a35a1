@@ -1,0 +1,668 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Toolbar from './components/Toolbar';
+import Timeline from './components/Timeline';
+import CueList from './components/CueList';
+import ShadowPanel from './components/ShadowPanel';
+import DriftPanel from './components/DriftPanel';
+import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
+import { formatClock, parseSrt, serializeSrt } from './lib/srt';
+import {
+  buildDriftPlan,
+  parseTimeInput,
+  resolveDriftRange,
+  secondsToInputTime
+} from './lib/drift';
+import {
+  computeLoopRange,
+  DEFAULT_LOOP_MARGINS,
+  loopDisableReason,
+  loopDisableText,
+  loopEntryTarget,
+  loopWrapTarget,
+  type LoopMargins,
+  type LoopRange
+} from './lib/abLoop';
+import {
+  commitHistory,
+  initHistory,
+  redoHistory,
+  replaceHistory,
+  undoHistory
+} from './lib/cues';
+import { detectSilences, type WindowLevels } from './lib/silence';
+import {
+  AbortToken,
+  analyzeAudioFile,
+  isAbortError
+} from './lib/audioAnalysis';
+
+interface Toast {
+  id: number;
+  kind: 'warn' | 'info' | 'error';
+  text: string;
+}
+
+/** dBFS 风格阈值转线性振幅：-60dB≈0.001, -40dB=0.01, -20dB=0.1 */
+function dbToAmplitude(db: number): number {
+  return Math.min(1, Math.pow(10, db / 20));
+}
+
+export default function App() {
+  const [history, setHistory] = useState(() => initHistory([]));
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [constraints, setConstraints] = useState<Constraints>({
+    minDuration: 0.5,
+    minGap: 0.08
+  });
+  const [pps, setPps] = useState(80);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [srtName, setSrtName] = useState<string | null>(null);
+  const [audioName, setAudioName] = useState<string | null>(null);
+  // 当前音频的 Object URL 镜像状态：供跟读面板创建独立播放轨（权威值仍在 audioUrlRef）
+  const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
+  // 单句跟读忙碌态（倒计时 + 录音）：期间暂停 A-B 回卷，结束自动恢复原开关状态
+  const [shadowBusy, setShadowBusy] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+
+  // 静音分析：吸附开关、可调阈值（dB）、分析状态与窗口能量
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState(-40);
+  const [levels, setLevels] = useState<WindowLevels | null>(null);
+  const [silenceStatus, setSilenceStatus] = useState<SilenceStatus>('idle');
+  const [silenceError, setSilenceError] = useState<string | null>(null);
+
+  // A-B 循环试听：开关与前后余量（区间由选中字幕推导，见下方 loopRange）
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  const [loopMargins, setLoopMargins] = useState<LoopMargins>(DEFAULT_LOOP_MARGINS);
+
+  // 区间漂移校准：锚点（最后一次普通点击的字幕）、Shift 指定的区间终点、目标锚点输入
+  const [driftAnchorId, setDriftAnchorId] = useState<string | null>(null);
+  const [driftEndId, setDriftEndId] = useState<string | null>(null);
+  const [driftInputs, setDriftInputs] = useState<{ start: string; end: string } | null>(null);
+  // 强制列表 / 时间轴重新滚动到选中字幕的信号（定位冲突时选中项可能未变）
+  const [focusNonce, setFocusNonce] = useState(0);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+  const toastId = useRef(0);
+  // 当前音频分析的取消令牌；更换音频时取消旧分析并阻止旧结果回写
+  const analysisTokenRef = useRef<AbortToken | null>(null);
+  // 最新循环计划的镜像，供音频事件 / rAF 回调读取，避免闭包过期；
+  // 暂停、导入新音频或关闭循环时同步置为失效，旧回调读到 inactive 即落空
+  const loopPlanRef = useRef<{ active: boolean; range: LoopRange | null }>({
+    active: false,
+    range: null
+  });
+  // 跟读录音忙碌态的 ref 镜像，供音频事件 / 键盘回调读取最新值
+  const shadowBusyRef = useRef(false);
+
+  const cues = history.present;
+
+  const pushToast = useCallback((kind: Toast['kind'], text: string) => {
+    toastId.current += 1;
+    const id = toastId.current;
+    setToasts((t) => [...t, { id, kind, text }]);
+    window.setTimeout(() => {
+      setToasts((t) => t.filter((x) => x.id !== id));
+    }, 4200);
+  }, []);
+
+  /* ---------------- 区间漂移校准：选择与清空 ---------------- */
+
+  /** 清空区间与预览（取消、切换文件时调用） */
+  const clearDrift = useCallback(() => {
+    setDriftAnchorId(null);
+    setDriftEndId(null);
+    setDriftInputs(null);
+  }, []);
+
+  /** 普通选择：更新选中与漂移锚点并收起已选区间；点击空白处仅取消选中，不动区间预览 */
+  const handleSelectCue = useCallback((id: string | null) => {
+    setSelectedId(id);
+    if (id === null) return;
+    setDriftAnchorId(id);
+    setDriftEndId(null);
+    setDriftInputs(null);
+  }, []);
+
+  /** Shift+点击：以当前锚点为起点选择连续区间，并用原始锚点初始化目标输入 */
+  const handleExtendDriftRange = useCallback(
+    (id: string) => {
+      const anchor = driftAnchorId ?? selectedId ?? id;
+      const range = resolveDriftRange(cues, anchor, id);
+      if (range.length === 0) return;
+      setDriftAnchorId(anchor);
+      setDriftEndId(id);
+      setSelectedId(id);
+      setDriftInputs({
+        start: secondsToInputTime(range[0].start),
+        end: secondsToInputTime(range[range.length - 1].end)
+      });
+    },
+    [cues, driftAnchorId, selectedId]
+  );
+
+  /* ---------------- 音频 ---------------- */
+
+  const ensureAudio = useCallback(() => {
+    if (!audioRef.current) {
+      const el = new Audio();
+      el.preload = 'auto';
+      el.addEventListener('timeupdate', () => setCurrentTime(el.currentTime));
+      el.addEventListener('loadedmetadata', () => setDuration(el.duration || 0));
+      el.addEventListener('play', () => setIsPlaying(true));
+      el.addEventListener('pause', () => setIsPlaying(false));
+      el.addEventListener('ended', () => {
+        // B 点被裁剪到音频结尾时，'ended' 先于「越过 B」发生：循环仍激活则回到 A 继续；
+        // 读取的是最新循环计划，导入新音频 / 关闭循环后计划已失效，不会拉回播放头
+        const plan = loopPlanRef.current;
+        if (plan.active && plan.range) {
+          el.currentTime = plan.range.a;
+          setCurrentTime(plan.range.a);
+          void el.play().catch(() => setIsPlaying(false));
+          return;
+        }
+        setIsPlaying(false);
+      });
+      audioRef.current = el;
+    }
+    return audioRef.current;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      analysisTokenRef.current?.abort();
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      audioRef.current?.pause();
+    };
+  }, []);
+
+  /**
+   * 跟读录音忙碌态变化：录音期间暂停主导航播放并抑制 A-B 回卷；
+   * 用户的循环开关状态本身不改动，忙碌结束后自动按原开关恢复。
+   */
+  const handleShadowBusyChange = useCallback((busy: boolean) => {
+    shadowBusyRef.current = busy;
+    setShadowBusy(busy);
+    if (busy) {
+      loopPlanRef.current = { active: false, range: null };
+      audioRef.current?.pause();
+    }
+  }, []);
+
+  /** 用 Web Audio API 解码并分析窗口能量；token 保证旧音频结果不会回写 */
+  const runSilenceAnalysis = useCallback(
+    (file: File) => {
+      analysisTokenRef.current?.abort();
+      const token = new AbortToken();
+      analysisTokenRef.current = token;
+      setSilenceStatus('analyzing');
+      setSilenceError(null);
+      analyzeAudioFile(file, token)
+        .then((result) => {
+          if (token.signal) return; // 已更换音频，丢弃旧结果
+          setLevels({ levels: result.levels, windowSize: result.windowSize, duration: result.duration });
+          setSilenceStatus('done');
+        })
+        .catch((err: unknown) => {
+          if (isAbortError(err)) return; // 更换音频导致的取消，静默处理
+          setSilenceStatus('error');
+          setSilenceError(err instanceof Error ? err.message : String(err));
+          pushToast('error', `静音分析失败：${err instanceof Error ? err.message : '音频无法解码'}`);
+        });
+    },
+    [pushToast]
+  );
+
+  const handleImportAudio = useCallback(
+    (file: File) => {
+      // 先作废旧循环计划：换源期间已排队的播放回调不得再拉回播放头
+      loopPlanRef.current = { active: false, range: null };
+      clearDrift(); // 切换文件：清空区间漂移预览
+      const el = ensureAudio();
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      const url = URL.createObjectURL(file);
+      audioUrlRef.current = url;
+      setAudioObjectUrl(url);
+      el.src = url;
+      el.load();
+      setAudioName(file.name);
+      setCurrentTime(0);
+      setLevels(null);
+      // 取消旧分析（若正在进行），并以新令牌开始本次分析，阻止旧结果回写
+      runSilenceAnalysis(file);
+      pushToast('info', `已加载音频：${file.name}`);
+    },
+    [ensureAudio, pushToast, runSilenceAnalysis, clearDrift]
+  );
+
+  // 阈值调整时基于窗口能量重新分段（纯前端计算，无需重新解码）
+  const silenceThreshold = useMemo(() => dbToAmplitude(silenceThresholdDb), [silenceThresholdDb]);
+  const silenceSegments = useMemo(
+    () => (levels ? detectSilences(levels, { threshold: silenceThreshold }) : []),
+    [levels, silenceThreshold]
+  );
+
+  const seek = useCallback(
+    (t: number, play = false) => {
+      const el = audioRef.current;
+      if (shadowBusyRef.current && play) {
+        // 跟读录音中禁止主导航自动播放，避免与跟读原音轨叠加
+        return;
+      }
+      if (!el || !audioUrlRef.current) {
+        // 未导入音频时仍允许播放头移动，便于纯字幕检查
+        setCurrentTime(Math.max(0, t));
+        return;
+      }
+      const target = Math.max(0, Math.min(t, el.duration || t));
+      el.currentTime = target;
+      setCurrentTime(target);
+      if (play) {
+        void el.play().catch(() => pushToast('error', '浏览器拒绝了自动播放，请再点一次播放'));
+      }
+    },
+    [pushToast]
+  );
+
+  const seekAndPlay = useCallback((t: number) => seek(t, true), [seek]);
+
+  const togglePlay = useCallback(() => {
+    const el = audioRef.current;
+    if (shadowBusyRef.current) {
+      // 跟读倒计时 / 录音中主导航让位于录音轨，避免与原音轨叠加播放
+      pushToast('warn', '跟读录音进行中，请使用跟读面板控制');
+      return;
+    }
+    if (!el || !audioUrlRef.current) {
+      pushToast('warn', '请先导入浏览器可播放的音频文件');
+      return;
+    }
+    if (el.paused) void el.play();
+    else el.pause();
+  }, [pushToast]);
+
+  /* ---------------- A-B 循环试听 ---------------- */
+
+  const selectedCue = useMemo(() => cues.find((c) => c.id === selectedId) ?? null, [cues, selectedId]);
+  const hasAudio = audioName !== null;
+  // 区间 = 选中字幕 ± 前后余量，裁剪到音频时长；选择或余量变化时自动更新
+  const loopRange = useMemo(
+    () => computeLoopRange(selectedCue, loopMargins, duration),
+    [selectedCue, loopMargins, duration]
+  );
+  const loopDisabled = loopDisableReason(hasAudio, selectedCue, loopRange);
+  // 跟读录音（倒计时 + 录音）期间暂停回卷：开关状态保留，结束自动恢复
+  const loopActive = loopEnabled && loopDisabled === null && loopRange !== null && !shadowBusy;
+  const loopSuspended = loopEnabled && loopDisabled === null && shadowBusy;
+
+  // 渲染期同步最新循环计划，供音频事件 / rAF 回调读取（写入幂等，StrictMode 安全）
+  loopPlanRef.current = { active: loopActive, range: loopActive ? loopRange : null };
+
+  // 帧级回卷监听：播放中越过 B 点即回到 A 点继续。
+  // 依赖变化（暂停 / 关闭 / 区间失效）或卸载时取消 rAF，且 tick 内再校验最新计划，
+  // 保证旧回调不会再次拉回播放头。
+  const loopMonitoring = loopActive && isPlaying;
+  useEffect(() => {
+    if (!loopMonitoring) return;
+    const el = audioRef.current;
+    if (!el) return;
+    let raf = 0;
+    const tick = () => {
+      const plan = loopPlanRef.current;
+      if (plan.active && plan.range && !el.paused) {
+        const target = loopWrapTarget(el.currentTime, plan.range);
+        if (target !== null) {
+          el.currentTime = target;
+          setCurrentTime(target);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [loopMonitoring]);
+
+  // 开启循环或切换选择后：播放头落在新区间外则立即跳到新 A 点（保持当前播放/暂停状态）
+  const loopEntryKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!loopActive || !loopRange) {
+      loopEntryKeyRef.current = null;
+      return;
+    }
+    const key = selectedId ?? '';
+    if (loopEntryKeyRef.current === key) return; // 同一路径不重复校正（余量微调不抢播放头）
+    loopEntryKeyRef.current = key;
+    const el = audioRef.current;
+    const now = el && audioUrlRef.current ? el.currentTime : currentTime;
+    const target = loopEntryTarget(now, loopRange);
+    if (target !== null) seek(target);
+  }, [loopActive, loopRange, selectedId, seek, currentTime]);
+
+  const handleLoopEnabledChange = useCallback((on: boolean) => {
+    if (!on) {
+      // 关闭循环：同步作废旧计划，已排队的播放回调不再拉回播放头
+      loopPlanRef.current = { active: false, range: null };
+    }
+    setLoopEnabled(on);
+  }, []);
+
+  /* ---------------- 历史 ---------------- */
+
+  const commit = useCallback((next: Cue[]) => {
+    setHistory((h) => commitHistory(h, next));
+  }, []);
+
+  const undo = useCallback(() => setHistory((h) => undoHistory(h)), []);
+  const redo = useCallback(() => setHistory((h) => redoHistory(h)), []);
+
+  /* ---------------- 区间漂移校准 ---------------- */
+
+  // 区间信息（与输入是否合法无关）：条数、列表序号与原始锚点
+  const driftRangeInfo = useMemo(() => {
+    if (!driftAnchorId || !driftEndId) return null;
+    const range = resolveDriftRange(cues, driftAnchorId, driftEndId);
+    if (range.length === 0) return null;
+    const sorted = [...cues].sort((a, b) => a.start - b.start || a.end - b.end);
+    const first = sorted.findIndex((c) => c.id === range[0].id);
+    const last = sorted.findIndex((c) => c.id === range[range.length - 1].id);
+    return {
+      ids: range.map((c) => c.id),
+      count: range.length,
+      first: first + 1,
+      last: last + 1,
+      oldStart: range[0].start,
+      oldEnd: range[range.length - 1].end
+    };
+  }, [cues, driftAnchorId, driftEndId]);
+
+  const driftParsed = useMemo(() => {
+    if (!driftInputs) return null;
+    return { start: parseTimeInput(driftInputs.start), end: parseTimeInput(driftInputs.end) };
+  }, [driftInputs]);
+
+  // 映射计划：输入可解析时始终完成映射（供预览），并给出按时间序的首个冲突
+  const driftPlan = useMemo(() => {
+    if (!driftAnchorId || !driftEndId || !driftParsed) return null;
+    if (driftParsed.start === null || driftParsed.end === null) return null;
+    return buildDriftPlan(
+      cues,
+      driftAnchorId,
+      driftEndId,
+      driftParsed.start,
+      driftParsed.end,
+      constraints
+    );
+  }, [cues, constraints, driftAnchorId, driftEndId, driftParsed]);
+
+  // 时间轴预览：旧位置（原块半透明）+ 新位置（虚影）+ 缩放比例
+  const driftPreview = useMemo<DriftPreview | null>(() => {
+    if (!driftPlan) return null;
+    const inRange = new Set(driftPlan.rangeIds);
+    return {
+      rangeIds: driftPlan.rangeIds,
+      mapped: driftPlan.mappedAll.filter((c) => inRange.has(c.id)),
+      newStart: driftPlan.newStart,
+      newEnd: driftPlan.newEnd,
+      scale: driftPlan.scale,
+      valid: driftPlan.conflict === null,
+      conflictCueId: driftPlan.conflict?.cueId ?? null
+    };
+  }, [driftPlan]);
+
+  const driftConflictId = driftPlan?.conflict?.cueId ?? null;
+  const lastAutoLocateRef = useRef<string | null>(null);
+  // 出现冲突时自动定位首个冲突字幕（同一冲突不重复抢选择；直接 setSelectedId 以保留区间）
+  useEffect(() => {
+    if (!driftConflictId) {
+      lastAutoLocateRef.current = null;
+      return;
+    }
+    if (lastAutoLocateRef.current === driftConflictId) return;
+    lastAutoLocateRef.current = driftConflictId;
+    setSelectedId(driftConflictId);
+    setFocusNonce((n) => n + 1);
+  }, [driftConflictId]);
+
+  const locateDriftConflict = useCallback(() => {
+    if (!driftConflictId) return;
+    setSelectedId(driftConflictId);
+    setFocusNonce((n) => n + 1);
+  }, [driftConflictId]);
+
+  /** 合法结果作为一次历史记录提交（整体可撤销/重做，走现有 SRT 导出） */
+  const applyDrift = useCallback(() => {
+    if (!driftPlan || driftPlan.conflict) return;
+    commit(driftPlan.mappedAll);
+    pushToast(
+      'info',
+      `已应用区间漂移校准：${driftPlan.rangeIds.length} 条字幕 · 缩放 ×${driftPlan.scale.toFixed(3)}`
+    );
+    clearDrift();
+  }, [driftPlan, commit, pushToast, clearDrift]);
+
+  /* ---------------- SRT ---------------- */
+
+  const handleImportSrt = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = parseSrt(String(reader.result ?? ''));
+        if (result.cues.length === 0) {
+          pushToast('error', '未从该文件解析出任何有效字幕');
+          return;
+        }
+        clearDrift(); // 切换字幕文件：清空区间漂移预览
+        setHistory((h) => replaceHistory(h, result.cues));
+        setSrtName(file.name);
+        setSelectedId(result.cues[0]?.id ?? null);
+        pushToast('info', `已导入 ${result.cues.length} 条字幕：${file.name}`);
+        result.warnings.forEach((w) => pushToast('warn', w));
+      };
+      reader.onerror = () => pushToast('error', `读取文件失败：${file.name}`);
+      reader.readAsText(file, 'utf-8');
+    },
+    [pushToast, clearDrift]
+  );
+
+  /* ---------------- 历史：快捷键 ---------------- */
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        redo();
+      } else if (e.key === ' ') {
+        e.preventDefault();
+        togglePlay();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [undo, redo, togglePlay]);
+
+  /* ---------------- 导出 ---------------- */
+
+  const exportSrt = useCallback(() => {
+    if (cues.length === 0) {
+      pushToast('warn', '没有可导出的字幕');
+      return;
+    }
+    const blob = new Blob([serializeSrt(cues)], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const base = (srtName ?? 'subtitles.srt').replace(/\.srt$/i, '');
+    a.href = url;
+    a.download = `${base}.fixed.srt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    pushToast('info', '已导出按时间顺序重新编号的 SRT');
+  }, [cues, srtName, pushToast]);
+
+  const statusText = useMemo(() => {
+    const parts: string[] = [];
+    parts.push(cues.length === 0 ? '等待导入：先选择 SRT，再选择音频' : `${cues.length} 条字幕`);
+    if (silenceStatus === 'analyzing') parts.push('静音分析中…');
+    else if (silenceStatus === 'done') {
+      parts.push(`${silenceSegments.length} 段静音` + (snapEnabled ? '· 吸附已开启' : '· 吸附已关闭'));
+    } else if (silenceStatus === 'error') parts.push('静音分析失败');
+    if (loopActive && loopRange) {
+      parts.push(`A-B 循环 ${formatClock(loopRange.a)} → ${formatClock(loopRange.b)}`);
+    } else if (loopSuspended) {
+      parts.push('跟读录音中 · A-B 回卷已暂时暂停');
+    } else if (loopEnabled && loopDisabled) {
+      parts.push(`循环待机：${loopDisableText(loopDisabled)}`);
+    }
+    if (shadowBusy) parts.push('正在跟读录音');
+    if (driftPlan) {
+      parts.push(
+        driftPlan.conflict
+          ? '区间漂移存在冲突，禁止提交'
+          : `区间漂移预览 ×${driftPlan.scale.toFixed(3)}（${driftPlan.rangeIds.length} 条）`
+      );
+    } else if (driftRangeInfo) {
+      parts.push(`区间漂移待输入目标锚点（${driftRangeInfo.count} 条）`);
+    }
+    if (cues.length > 0) parts.push(`已记录 ${history.past.length} 次调整`);
+    return parts.join(' · ');
+  }, [
+    cues.length,
+    history.past.length,
+    silenceStatus,
+    silenceSegments.length,
+    snapEnabled,
+    loopActive,
+    loopSuspended,
+    loopRange,
+    loopEnabled,
+    loopDisabled,
+    shadowBusy,
+    driftPlan,
+    driftRangeInfo
+  ]);
+
+  return (
+    <div className="app">
+      <Toolbar
+        audioName={audioName}
+        srtName={srtName}
+        isPlaying={isPlaying}
+        currentTime={currentTime}
+        duration={duration}
+        canUndo={history.past.length > 0}
+        canRedo={history.future.length > 0}
+        pps={pps}
+        constraints={constraints}
+        onImportSrt={handleImportSrt}
+        onImportAudio={handleImportAudio}
+        onTogglePlay={togglePlay}
+        onSeek={seekAndPlay}
+        onUndo={undo}
+        onRedo={redo}
+        onZoom={setPps}
+        onConstraintsChange={setConstraints}
+        onExport={exportSrt}
+        canExport={cues.length > 0}
+        snapEnabled={snapEnabled}
+        onSnapEnabledChange={setSnapEnabled}
+        silenceThresholdDb={silenceThresholdDb}
+        onSilenceThresholdChange={setSilenceThresholdDb}
+        silenceStatus={silenceStatus}
+        silenceSegmentCount={silenceSegments.length}
+        silenceError={silenceError}
+        loopEnabled={loopEnabled}
+        loopRange={loopActive ? loopRange : null}
+        loopSuspended={loopSuspended}
+        loopDisabledReason={loopDisabled ? loopDisableText(loopDisabled) : null}
+        loopMargins={loopMargins}
+        onLoopEnabledChange={handleLoopEnabledChange}
+        onLoopMarginsChange={setLoopMargins}
+      />
+
+      <main className="main">
+        <section className="stage">
+          <div className="status-bar">
+            <span>{statusText}</span>
+            <span className="status-hint">
+              拖动字幕块左右边界校对 · 靠近静音带边缘 150ms 自动吸附 · 越界自动回弹并提示原因 · 点击字幕块定位播放 · 列表 Shift+点击选区间做漂移校准
+            </span>
+          </div>
+          <Timeline
+            cues={cues}
+            duration={duration}
+            currentTime={currentTime}
+            isPlaying={isPlaying}
+            pps={pps}
+            constraints={constraints}
+            selectedId={selectedId}
+            silences={silenceSegments}
+            snapEnabled={snapEnabled}
+            loopRange={loopActive ? loopRange : null}
+            driftPreview={driftPreview}
+            focusNonce={focusNonce}
+            onSelect={handleSelectCue}
+            onSeek={seekAndPlay}
+            onCommit={commit}
+            onNotice={(text) => pushToast('warn', text)}
+          />
+          {driftRangeInfo && driftInputs && (
+            <DriftPanel
+              rangeCount={driftRangeInfo.count}
+              firstIndex={driftRangeInfo.first}
+              lastIndex={driftRangeInfo.last}
+              oldStart={driftRangeInfo.oldStart}
+              oldEnd={driftRangeInfo.oldEnd}
+              startInput={driftInputs.start}
+              endInput={driftInputs.end}
+              startValid={driftParsed?.start !== null}
+              endValid={driftParsed?.end !== null}
+              plan={driftPlan}
+              onStartInput={(v) => setDriftInputs((s) => (s ? { ...s, start: v } : s))}
+              onEndInput={(v) => setDriftInputs((s) => (s ? { ...s, end: v } : s))}
+              onApply={applyDrift}
+              onCancel={clearDrift}
+              onLocateConflict={locateDriftConflict}
+            />
+          )}
+          <ShadowPanel
+            cue={selectedCue}
+            audioUrl={audioObjectUrl}
+            duration={duration}
+            onNotice={(text) => pushToast('warn', text)}
+            onBusyChange={handleShadowBusyChange}
+          />
+        </section>
+        <CueList
+          cues={cues}
+          currentTime={currentTime}
+          selectedId={selectedId}
+          driftRangeIds={driftRangeInfo?.ids ?? null}
+          driftConflictId={driftConflictId}
+          focusNonce={focusNonce}
+          onSelect={handleSelectCue}
+          onExtendRange={handleExtendDriftRange}
+          onSeek={seekAndPlay}
+        />
+      </main>
+
+      <div className="toasts">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.kind}`}>
+            {t.text}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
