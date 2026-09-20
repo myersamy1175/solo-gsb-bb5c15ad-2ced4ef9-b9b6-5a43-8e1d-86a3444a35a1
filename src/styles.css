@@ -1272,3 +1272,219 @@ body {
   background: rgba(255, 93, 108, 0.1);
   box-shadow: inset 3px 0 0 var(--danger);
 }
+
+/* ---------------- 会话恢复 / 自动保存 ---------------- */
+
+.session-group {
+  gap: 10px;
+}
+
+.save-state {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.save-state.working {
+  color: var(--warn);
+}
+
+.save-state.done {
+  color: #74d6a4;
+}
+
+.save-state.failed {
+  color: var(--danger);
+}
+
+/* 恢复后等待重选音频的提示条 */
+
+.audio-pending-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: rgba(245, 181, 68, 0.12);
+  border-bottom: 1px solid rgba(245, 181, 68, 0.45);
+  font-size: 13px;
+  color: #f3d9a0;
+}
+
+.audio-pending-icon {
+  font-size: 16px;
+}
+
+.audio-pending-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.audio-pending-text strong {
+  color: #ffe3ac;
+}
+
+.audio-pending-text code,
+.recovery-item-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* 恢复会话弹窗 */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 10, 18, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.recovery-dialog {
+  width: min(760px, calc(100vw - 48px));
+  max-height: calc(100vh - 80px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.recovery-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.recovery-title {
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.recovery-note {
+  margin: 0;
+  padding: 10px 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.18);
+  border-bottom: 1px solid var(--line);
+}
+
+.recovery-error {
+  margin: 10px 18px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #ffd7db;
+  background: rgba(255, 93, 108, 0.12);
+  border: 1px solid rgba(255, 93, 108, 0.45);
+}
+
+.recovery-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.recovery-empty {
+  padding: 36px 0;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.recovery-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-track);
+}
+
+.recovery-item.active {
+  border-color: rgba(91, 149, 255, 0.65);
+  box-shadow: inset 3px 0 0 var(--cue-border);
+}
+
+.recovery-item.invalid {
+  opacity: 0.85;
+  border-color: rgba(255, 93, 108, 0.4);
+}
+
+.recovery-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.recovery-item-name {
+  font-weight: 600;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.recovery-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 8px;
+  border-radius: 10px;
+  color: #bcd2ff;
+  background: rgba(79, 140, 255, 0.16);
+  border: 1px solid rgba(79, 140, 255, 0.4);
+}
+
+.recovery-item-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.recovery-item-meta .bad {
+  color: #ff9aa4;
+}
+
+.audio-pending-tag {
+  margin-left: 4px;
+  padding: 0 7px;
+  border-radius: 9px;
+  font-size: 11px;
+  color: #f3d9a0;
+  background: rgba(245, 181, 68, 0.15);
+}
+
+.recovery-item-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.recovery-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.15);
+}

@@ -1,9 +1,12 @@
 import type { Constraints, SilenceStatus } from '../types';
 import { formatClock } from '../lib/srt';
 import type { LoopMargins, LoopRange } from '../lib/abLoop';
+import type { SaveStatus } from '../lib/session';
 
 interface ToolbarProps {
   audioName: string | null;
+  /** 恢复会话后等待重新选择音频：播放相关控件禁用 */
+  audioPending: boolean;
   srtName: string | null;
   isPlaying: boolean;
   currentTime: number;
@@ -40,6 +43,13 @@ interface ToolbarProps {
   onSilenceThresholdChange: (db: number) => void;
   onExport: () => void;
   canExport: boolean;
+  /** 本地会话自动保存开关 */
+  autoSave: boolean;
+  onAutoSaveChange: (on: boolean) => void;
+  /** 自动保存状态（最近一次保存时间 / 失败原因） */
+  saveStatus: SaveStatus;
+  /** 打开「恢复会话」列表 */
+  onOpenRecovery: () => void;
 }
 
 export default function Toolbar(p: ToolbarProps) {
@@ -80,7 +90,16 @@ export default function Toolbar(p: ToolbarProps) {
       </div>
 
       <div className="group transport">
-        <button className="btn icon" onClick={p.onTogglePlay} disabled={!p.audioName} title="播放/暂停（空格）">
+        <button
+          className="btn icon"
+          onClick={p.onTogglePlay}
+          disabled={!p.audioName || p.audioPending}
+          title={
+            p.audioPending
+              ? '已恢复会话：请重新选择同一音频并通过 SHA-256 校验后再播放'
+              : '播放/暂停（空格）'
+          }
+        >
           {p.isPlaying ? '⏸' : '▶'}
         </button>
         <span className="clock">
@@ -242,6 +261,48 @@ export default function Toolbar(p: ToolbarProps) {
         <button className="btn" onClick={p.onRedo} disabled={!p.canRedo} title="重做（Ctrl/⌘+Shift+Z）">
           ↷ 重做
         </button>
+      </div>
+
+      <div className="group session-group">
+        <button className="btn" onClick={p.onOpenRecovery} title="列出本浏览器中可恢复的校对会话">
+          🗂 恢复会话
+        </button>
+        <label
+          className="switch"
+          title="开启后字幕、撤销/重做历史、约束与视图设置变化后自动保存到 IndexedDB；音频文件不落盘"
+        >
+          <input
+            type="checkbox"
+            checked={p.autoSave}
+            onChange={(e) => p.onAutoSaveChange(e.target.checked)}
+          />
+          自动保存
+        </label>
+        <span
+          className={[
+            'save-state',
+            p.saveStatus.kind === 'error'
+              ? 'failed'
+              : p.saveStatus.kind === 'saved'
+                ? 'done'
+                : p.saveStatus.kind === 'idle'
+                  ? ''
+                  : 'working'
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          title={p.saveStatus.kind === 'error' ? p.saveStatus.message : '快照保存在本浏览器 IndexedDB 中'}
+        >
+          {p.saveStatus.kind === 'idle'
+            ? p.autoSave
+              ? '自动保存就绪'
+              : '自动保存已停用'
+            : p.saveStatus.kind === 'pending' || p.saveStatus.kind === 'saving'
+              ? '保存中…'
+              : p.saveStatus.kind === 'error'
+                ? '保存失败'
+                : `已保存 ${new Date(p.saveStatus.at).toLocaleTimeString()}`}
+        </span>
       </div>
 
       <button className="btn primary" onClick={p.onExport} disabled={!p.canExport}>

@@ -35,6 +35,12 @@ import {
   resolveDriftRange,
   secondsToInputTime
 } from '../src/lib/drift';
+import { sha256Bytes } from '../src/lib/sha256';
+import {
+  matchAudioFingerprint,
+  SESSION_SCHEMA_VERSION,
+  validateSession
+} from '../src/lib/session';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -462,5 +468,95 @@ const driftCues = [
     '漂移结果可由现有 SRT 导出'
   );
 }
+
+/* ---------------- 会话恢复：SHA-256 / 指纹 / 快照校验 ---------------- */
+
+// 空串与 "abc" 的标准 SHA-256 向量
+assert(
+  sha256Bytes(new TextEncoder().encode('')) ===
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  'SHA-256 空向量'
+);
+assert(
+  sha256Bytes(new TextEncoder().encode('abc')) ===
+    'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+  'SHA-256 "abc" 向量'
+);
+// 覆盖多块（>64 字节）与长度恰好跨过块边界的填充
+assert(
+  sha256Bytes(new TextEncoder().encode('a'.repeat(55))).length === 64,
+  'SHA-256 55 字节（跨块填充）输出长度 64'
+);
+assert(
+  sha256Bytes(new TextEncoder().encode('a'.repeat(200))) ===
+    sha256Bytes(new TextEncoder().encode('a'.repeat(200))),
+  'SHA-256 长输入确定性'
+);
+
+// 指纹匹配以大小 + 哈希为准，文件名可不同
+const fp = { name: 'a.wav', size: 100, sha256: 'a'.repeat(64) };
+assert(matchAudioFingerprint(fp, { name: 'a.wav', size: 100, sha256: 'a'.repeat(64) }).matched, '同名同指纹匹配');
+const renamed = matchAudioFingerprint(fp, { name: 'b.wav', size: 100, sha256: 'a'.repeat(64) });
+assert(renamed.matched && renamed.nameMismatch, '仅文件名不同仍匹配但标记 nameMismatch');
+assert(!matchAudioFingerprint(fp, { name: 'a.wav', size: 99, sha256: 'a'.repeat(64) }).matched, '大小不同拒绝');
+assert(!matchAudioFingerprint(fp, { name: 'a.wav', size: 100, sha256: 'b'.repeat(64) }).matched, '哈希不同拒绝');
+
+// 构造一份合法会话
+function makeValidSession(over: Record<string, unknown> = {}): Record<string, unknown> {
+  const cue = (id: string, s: number, e: number) => ({ id, start: s, end: e, text: id });
+  return {
+    id: 's1',
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    revision: 3,
+    createdAt: 1000,
+    updatedAt: 2000,
+    srtName: 'x.srt',
+    snapshot: {
+      past: [[cue('a', 0, 1), cue('b', 2, 3)]],
+      present: [cue('a', 0, 1.5), cue('b', 2, 3)],
+      future: []
+    },
+    view: {
+      constraints: { minDuration: 0.5, minGap: 0.08 },
+      pps: 80,
+      snapEnabled: true,
+      silenceThresholdDb: -40,
+      loopEnabled: false,
+      loopMargins: { pre: 0.3, post: 0.3 },
+      selectedId: 'a'
+    },
+    audio: { name: 'a.wav', size: 100, sha256: 'a'.repeat(64) },
+    ...over
+  };
+}
+
+assert(validateSession(makeValidSession()).ok, '合法会话校验通过');
+assert(
+  validateSession(makeValidSession({ schemaVersion: 99 })).ok === false,
+  '结构版本不匹配拒绝（失败不得改动工作区）'
+);
+assert(
+  validateSession(makeValidSession({ revision: -2 })).ok === false,
+  'revision 非非负整数拒绝'
+);
+assert(
+  validateSession(makeValidSession({ updatedAt: 500 })).ok === false,
+  'updatedAt 早于 createdAt 拒绝'
+);
+const badStack = makeValidSession();
+(badStack.snapshot as Record<string, unknown>).past = [
+  [{ id: 'a', start: 0, end: 1, text: 'a' }] // 缺少 b，且只有一帧——id 集合与 present 不一致
+];
+assert(validateSession(badStack).ok === false, '撤销栈字幕集合与当前不一致拒绝');
+const badAudio = makeValidSession({ audio: { name: 'a.wav', size: 1, sha256: 'zzz' } });
+assert(validateSession(badAudio).ok === false, '音频指纹格式损坏拒绝');
+const badView = makeValidSession();
+badView.view = { ...(badView.view as object), pps: 99999 };
+assert(validateSession(badView).ok === false, '视图设置越界拒绝');
+const badSelected = makeValidSession();
+badSelected.view = { ...(badSelected.view as object), selectedId: 'ghost' };
+assert(validateSession(badSelected).ok === false, '选中字幕不属于会话拒绝');
+const nullAudio = makeValidSession({ audio: null });
+assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
 
 process.exit(fail ? 1 : 0);
