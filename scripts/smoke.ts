@@ -35,6 +35,27 @@ import {
   resolveDriftRange,
   secondsToInputTime
 } from '../src/lib/drift';
+import {
+  SESSION_SCHEMA_VERSION,
+  buildSessionState,
+  resolveWriteRevision,
+  validateAudioFingerprint,
+  validateCueShape,
+  validateSessionState,
+  validateStoredRecord
+} from '../src/lib/session';
+import { fingerprintsMatch, formatBytes } from '../src/lib/fingerprint';
+import {
+  deleteSession,
+  getSession,
+  listRecoverableSessions,
+  putSession,
+  randomSessionId,
+  SESSION_DB_NAME
+} from '../src/lib/sessionStore';
+
+// smoke 在 Node 下运行：用 fake-indexeddb 提供 indexedDB 全局
+import 'fake-indexeddb/auto';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -463,4 +484,274 @@ const driftCues = [
   );
 }
 
-process.exit(fail ? 1 : 0);
+// 22. 本地会话：快照结构与版本校验
+{
+  const validView = {
+    pps: 80,
+    constraints: { minDuration: 0.5, minGap: 0.08 },
+    snapEnabled: true,
+    silenceThresholdDb: -40,
+    loopEnabled: false,
+    loopMargins: { pre: 0.3, post: 0.3 },
+    selectedId: 'a'
+  };
+  const makeState = (patch: Record<string, unknown> = {}) => ({
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    revision: 3,
+    srtName: 'a.srt',
+    history: {
+      past: [[{ id: 'old', start: 0, end: 1, text: 'o' }]],
+      present: [
+        { id: 'a', start: 1, end: 2, text: 'a' },
+        { id: 'b', start: 3, end: 4, text: 'b' }
+      ],
+      future: []
+    },
+    view: validView,
+    audio: { name: 'a.mp3', size: 123, sha256: 'a'.repeat(64) },
+    ...patch
+  });
+
+  let vr = validateSessionState(makeState());
+  assert(vr.ok, '合法快照通过校验');
+  if (vr.ok) {
+    assert(vr.data.revision === 3, '校验返回归一化快照');
+    assert(vr.data.audio?.sha256 === 'a'.repeat(64), '保留音频指纹');
+  }
+
+  // 版本不一致：拒绝
+  vr = validateSessionState(makeState({ schemaVersion: 999 }));
+  assert(!vr.ok && vr.ok === false && /版本/.test(vr.reason), '未知结构版本被拒绝');
+
+  // 关键结构损坏：逐项拒绝，且不抛异常
+  assert(!validateSessionState(makeState({ revision: -1 })).ok, '负 revision 被拒绝');
+  assert(!validateSessionState(makeState({ revision: 1.5 })).ok, '非整数 revision 被拒绝');
+  assert(!validateSessionState(makeState({ srtName: 7 })).ok, 'SRT 名称类型错误被拒绝');
+  assert(!validateSessionState(makeState({ history: null })).ok, '历史为空被拒绝');
+  assert(!validateSessionState(makeState({ history: { past: [], present: [], future: [] } })).ok, '空字幕会话被拒绝');
+  assert(
+    !validateSessionState(
+      makeState({
+        history: {
+          past: [],
+          present: [{ id: 'a', start: 2, end: 1, text: 'a' }],
+          future: []
+        }
+      })
+    ).ok,
+    '结束早于开始的字幕被拒绝'
+  );
+  assert(
+    !validateSessionState(
+      makeState({
+        history: {
+          past: [],
+          present: [
+            { id: 'a', start: 1, end: 2, text: 'a' },
+            { id: 'a', start: 3, end: 4, text: 'a2' }
+          ],
+          future: []
+        }
+      })
+    ).ok,
+    'present 中重复 id 被拒绝'
+  );
+  assert(!validateSessionState(makeState({ view: { ...validView, pps: 5 } })).ok, '超范围 pps 被拒绝');
+  assert(
+    !validateSessionState(makeState({ view: { ...validView, silenceThresholdDb: 0 } })).ok,
+    '超范围静音阈值被拒绝'
+  );
+  assert(
+    !validateSessionState(makeState({ view: { ...validView, loopMargins: { pre: -1, post: 0 } } })).ok,
+    '负循环余量被拒绝'
+  );
+
+  // 选中字幕引用缺失：不拒绝，归一化为 null
+  vr = validateSessionState(makeState({ view: { ...validView, selectedId: 'ghost' } }));
+  assert(vr.ok && vr.data.view.selectedId === null, '失效 selectedId 归一化为 null');
+
+  // 音频指纹校验：哈希格式、大小写归一
+  let ar = validateAudioFingerprint({ name: 'x', size: 10, sha256: 'A'.repeat(64) });
+  assert(ar.ok && ar.data.sha256 === 'a'.repeat(64), '大写哈希归一化为小写');
+  assert(!validateAudioFingerprint({ name: '', size: 10, sha256: 'a'.repeat(64) }).ok, '空文件名被拒绝');
+  assert(!validateAudioFingerprint({ name: 'x', size: -1, sha256: 'a'.repeat(64) }).ok, '负文件大小被拒绝');
+  assert(!validateAudioFingerprint({ name: 'x', size: 10, sha256: 'z'.repeat(64) }).ok, '非十六进制哈希被拒绝');
+  assert(!validateAudioFingerprint({ name: 'x', size: 10, sha256: 'a'.repeat(63) }).ok, '长度不足哈希被拒绝');
+
+  // 单条字幕结构
+  assert(validateCueShape({ id: 'a', start: 0, end: 1, text: '' }).ok, '空文本字幕结构合法');
+  assert(!validateCueShape({ id: '', start: 0, end: 1, text: '' }).ok, '空 id 被拒绝');
+
+  // 撤销栈是 Cue[][]：多帧结构可校验
+  vr = validateSessionState(
+    makeState({
+      history: {
+        past: [
+          [{ id: 'p1', start: 0, end: 1, text: 'p1' }],
+          [{ id: 'p2', start: 2, end: 3, text: 'p2' }]
+        ],
+        present: [{ id: 'n', start: 4, end: 5, text: 'n' }],
+        future: [[{ id: 'f', start: 6, end: 7, text: 'f' }]]
+      }
+    })
+  );
+  assert(vr.ok && vr.data.history.past.length === 2 && vr.data.history.future.length === 1, '撤销/重做栈多帧校验通过');
+  assert(
+    !validateSessionState(
+      makeState({
+        history: {
+          past: [{ id: 'p1', start: 0, end: 1, text: 'p1' }], // 应为 Cue[] 的数组
+          present: [{ id: 'n', start: 4, end: 5, text: 'n' }],
+          future: []
+        }
+      })
+    ).ok,
+    '撤销栈帧不是数组时被拒绝'
+  );
+
+  // 完整记录：cueCount 冗余一致性
+  const record = {
+    ...makeState(),
+    id: 'sess-1',
+    createdAt: 1000,
+    updatedAt: 2000,
+    cueCount: 2
+  };
+  assert(validateStoredRecord(record).ok, '完整记录通过校验');
+  assert(!validateStoredRecord({ ...record, cueCount: 3 }).ok, 'cueCount 不一致被拒绝');
+  assert(!validateStoredRecord({ ...record, id: '' }).ok, '空会话 id 被拒绝');
+  assert(!validateStoredRecord({ ...record, updatedAt: 'x' }).ok, '时间戳非法被拒绝');
+
+  // buildSessionState 携带给定 revision 基准
+  const built = buildSessionState({
+    srtName: 'x.srt',
+    history: {
+      past: [],
+      present: [{ id: 'n', start: 4, end: 5, text: 'n' }],
+      future: []
+    },
+    view: validView,
+    audio: null,
+    baseRevision: 41
+  });
+  assert(built.schemaVersion === SESSION_SCHEMA_VERSION && built.revision === 41 && built.audio === null, '快照构造携带 revision 与空音频');
+}
+
+// 23. 本地会话：事务内 revision 单调递增裁决
+{
+  assert(resolveWriteRevision(null, 0) === 1, '新会话从 1 开始');
+  assert(resolveWriteRevision(null, 9) === 10, '无库内记录时基准 +1');
+  assert(resolveWriteRevision(5, 5) === 6, '基准与库内一致 -> +1');
+  assert(resolveWriteRevision(5, 8) === 9, '基准领先库内 -> 基准 +1');
+  assert(resolveWriteRevision(8, 5) === null, '库内严格更新 -> 拒绝旧 revision 覆盖');
+  assert(resolveWriteRevision(1, 0) === null, '库内 1 / 基准 0（调用方未见过 rev 1）同样拒绝');
+  assert(resolveWriteRevision(3, -1) === null, '非法基准返回 null');
+  assert(resolveWriteRevision(2, 2.5) === null, '非整数基准返回 null');
+}
+
+// 24. 音频指纹匹配与大小格式化
+{
+  const expected = { name: 'a.wav', size: 100, sha256: 'a'.repeat(64) };
+  assert(fingerprintsMatch({ name: 'renamed.wav', size: 100, sha256: 'a'.repeat(64) }, expected), '重命名不影响匹配（大小+哈希一致）');
+  assert(!fingerprintsMatch({ name: 'a.wav', size: 101, sha256: 'a'.repeat(64) }, expected), '大小不一致不匹配');
+  assert(!fingerprintsMatch({ name: 'a.wav', size: 100, sha256: 'b'.repeat(64) }, expected), '哈希不一致不匹配');
+  assert(!fingerprintsMatch({ name: 'a.wav', size: 100, sha256: 'a'.repeat(64) }, null), '无期望指纹不匹配');
+  assert(formatBytes(0) === '0 B', '0 B 格式化');
+  assert(formatBytes(2048) === '2.0 KB', 'KB 格式化');
+}
+
+// 25. 本地会话：IndexedDB 事务内 revision 保护（旧 revision 拒绝覆盖新状态）
+async function runSessionStoreTests() {
+  // 干净数据库（模块内连接带缓存，故测试开始前先删掉可能存在的库）
+  await new Promise<void>((resolve) => {
+    const del = indexedDB.deleteDatabase(SESSION_DB_NAME);
+    del.onsuccess = () => resolve();
+    del.onerror = () => resolve();
+    del.onblocked = () => resolve();
+  });
+
+  const id = randomSessionId();
+  assert(id.length > 0, '生成会话 id');
+  const frame = (idc: string, start: number) => ({ id: idc, start, end: start + 1, text: idc });
+  const stateAt = (rev: number, n: number) =>
+    buildSessionState({
+      srtName: `${n}.srt`,
+      history: { past: [], present: [frame('a', n)], future: [] },
+      view: {
+        pps: 80,
+        constraints: { minDuration: 0.5, minGap: 0.08 },
+        snapEnabled: true,
+        silenceThresholdDb: -40,
+        loopEnabled: false,
+        loopMargins: { pre: 0.3, post: 0.3 },
+        selectedId: 'a'
+      },
+      audio: null,
+      baseRevision: rev
+    });
+
+  // 初次写入：基准 0 -> revision 1
+  let w = await putSession(stateAt(0, 1), id);
+  assert(w.kind === 'ok' && w.revision === 1, `初次写入 revision=1（实际 ${w.kind === 'ok' ? w.revision : w.kind}）`);
+  if (w.kind !== 'ok') return;
+
+  // 正常顺序写入：基准 1 -> 2
+  w = await putSession(stateAt(1, 2), id);
+  assert(w.kind === 'ok' && w.revision === 2, '顺序写入 revision 递增到 2');
+
+  // 模拟乱序到达的旧异步写入：基准仍为 0，事务内读到库内 2 -> 拒绝
+  const staleWrite = putSession(stateAt(0, 999), id);
+  const freshWrite = putSession(stateAt(2, 3), id); // 与旧写入并发的正常写入
+  const staleResult = await staleWrite;
+  const freshResult = await freshWrite;
+  assert(staleResult.kind === 'stale', '事务内拒绝旧 revision 覆盖新状态');
+  assert(freshResult.kind === 'ok' || freshResult.kind === 'stale', '并发的新写入返回 ok，或串行下的可重试 stale');
+  // 若新写入先被旧基准挤成 stale，则按库内版本重试一次也应成功
+  if (freshResult.kind === 'stale') {
+    const retry = await putSession(stateAt(freshResult.existingRevision, 3), id);
+    assert(retry.kind === 'ok', 'stale 后按库内版本重试成功');
+  }
+
+  // 库内状态未被旧快照污染：srtName 永远不是 999.srt
+  const stored = await getSession(id);
+  assert(stored !== null, '会话可按 id 读取且经过完整校验');
+  assert(stored?.revision === 3 && stored.srtName === '3.srt', `库内为最新 revision 3（实际 rev=${stored?.revision} name=${stored?.srtName}）`);
+  assert(stored.cueCount === 1, 'cueCount 冗余字段正确');
+
+  // 列表 / 删除
+  const list = await listRecoverableSessions();
+  assert(list.length === 1 && list[0].valid && list[0].meta.id === id, '恢复列表含 1 条有效会话');
+  assert(list[0].meta.srtName === '3.srt', '列表元信息正确');
+  await deleteSession(id);
+  assert((await getSession(id)) === null, '删除后读取为 null');
+  assert((await listRecoverableSessions()).length === 0, '删除后列表为空');
+
+  // 损坏记录：列表标记 invalid 且禁止恢复，但可以删除
+  const badId = randomSessionId();
+  await new Promise<void>((resolve, reject) => {
+    const open = indexedDB.open(SESSION_DB_NAME);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('sessions', 'readwrite');
+      tx.objectStore('sessions').put({ id: badId, schemaVersion: 1, revision: 0, garbage: true });
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+    open.onerror = () => reject(open.error);
+  });
+  const badList = await listRecoverableSessions();
+  assert(badList.length === 1 && !badList[0].valid, '损坏记录在列表中标记为不可恢复');
+  assert((await getSession(badId)) === null, '损坏记录读取被结构校验拒绝');
+  await deleteSession(badId);
+  assert((await listRecoverableSessions()).length === 0, '损坏记录仍可删除');
+}
+
+async function main() {
+  await runSessionStoreTests();
+  process.exit(fail ? 1 : 0);
+}
+
+void main();

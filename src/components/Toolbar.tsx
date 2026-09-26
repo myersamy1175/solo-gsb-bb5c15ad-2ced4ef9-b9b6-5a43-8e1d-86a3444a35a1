@@ -28,6 +28,13 @@ interface ToolbarProps {
   loopMargins: LoopMargins;
   onLoopEnabledChange: (on: boolean) => void;
   onLoopMarginsChange: (next: LoopMargins) => void;
+  /** 恢复会话后等待重新选择的音频文件名（指纹尚未匹配，播放禁用） */
+  audioPendingName: string | null;
+  /** 音频指纹计算中（SHA-256） */
+  audioHashing: boolean;
+  autosaveEnabled: boolean;
+  onAutosaveChange: (enabled: boolean) => void;
+  onOpenRecover: () => void;
   onImportSrt: (file: File) => void;
   onImportAudio: (file: File) => void;
   onTogglePlay: () => void;
@@ -62,7 +69,7 @@ export default function Toolbar(p: ToolbarProps) {
           />
         </label>
         <label className="btn">
-          导入音频
+          {p.audioPendingName ? '重新选择音频' : '导入音频'}
           <input
             type="file"
             accept="audio/*,.m4a,.aac,.ogg,.opus,.webm"
@@ -74,8 +81,17 @@ export default function Toolbar(p: ToolbarProps) {
             }}
           />
         </label>
-        <span className="file-names" title={[p.srtName, p.audioName].filter(Boolean).join(' / ')}>
-          {p.srtName ?? '未选择字幕'} · {p.audioName ?? '未选择音频'}
+        <span className="file-names" title={[p.srtName, p.audioName ?? p.audioPendingName].filter(Boolean).join(' / ')}>
+          {p.srtName ?? '未选择字幕'} ·{' '}
+          {p.audioName ??
+            (p.audioPendingName ? (
+              <span className="audio-pending">
+                {p.audioPendingName}（待重新校验，已禁用播放）
+              </span>
+            ) : (
+              '未选择音频'
+            ))}
+          {p.audioHashing && <span className="audio-hashing">指纹计算中…</span>}
         </span>
       </div>
 
@@ -241,6 +257,27 @@ export default function Toolbar(p: ToolbarProps) {
         </button>
         <button className="btn" onClick={p.onRedo} disabled={!p.canRedo} title="重做（Ctrl/⌘+Shift+Z）">
           ↷ 重做
+        </button>
+      </div>
+
+      <div className="group session-group">
+        <label
+          className="switch"
+          title="字幕、撤销/重做历史、约束与视图设置变化后自动保存到本机 IndexedDB；停用时立即保存当前状态，之后不再写入"
+        >
+          <input
+            type="checkbox"
+            checked={p.autosaveEnabled}
+            onChange={(e) => p.onAutosaveChange(e.target.checked)}
+          />
+          自动保存
+        </label>
+        <button
+          className="btn"
+          onClick={p.onOpenRecover}
+          title="列出保存在本机的可恢复会话"
+        >
+          恢复会话
         </button>
       </div>
 
